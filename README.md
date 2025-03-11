@@ -263,9 +263,3 @@ def extract(self, url: str, soup: BeautifulSoup, html: str) -> Dict[str, Any]:
                 code_text = code.get_text(strip=True)
                 pre.replace_with(f"\n```{language}\n{code_text}\n```\n")
 ```
-
-## 結論
-
-這個雙組件網絡爬蟲系統實現了理論完善、計算高效的網頁內容提取方法，對資源利用、錯誤恢復能力和內容完整性提供形式保證。模塊化架構使搜索和提取過程能夠獨立擴展，同時保持強大的故障隔離邊界。
-
-系統基於計算理論和形式化方法，不僅能夠有效應對當前網絡環境下的爬取挑戰，還提供了一個可以在理論層面進行擴展和完善的框架。特別適合需要高可靠性、高效率和強大擴展能力的專業數據採集場景。
