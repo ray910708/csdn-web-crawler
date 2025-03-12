@@ -9,9 +9,6 @@ python cdsn.py --query "人工智能" --start 5 --count 10
 从第10篇开始，爬取所有剩余文章
 python cdsn.py --query "深度学习" --start 0
 
-使用特定方法并指定文章范围
-python cdsn.py --query "Python教程" --method dynamic --start 3 --count 7
-
 # 高級網絡爬蟲系統：多策略提取框架
 
 ## 計算架構概述
@@ -59,7 +56,6 @@ python cdsn.py --query "Python教程" --method dynamic --start 3 --count 7
 - `WebDriverManager`：Selenium資源生命周期管理
 
 #### 高級特性
-- 多策略搜索實現（API、動態、靜態）
 - 具有馬可夫鏈狀態轉移的概率請求分布
 - 實現指數退避算法的自適應延遲機制
 - 通過信號量調節的線程池實現形式化並發控制
