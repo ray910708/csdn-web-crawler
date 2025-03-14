@@ -52,6 +52,7 @@ class ScrapingConfig:
     image_download_timeout: int = 20
     max_image_workers: int = 3
     min_content_length: int = 500
+    paywall_threshold: int = 30
     
     def __post_init__(self):
         """驗證配置參數的有效性"""
@@ -65,6 +66,8 @@ class ScrapingConfig:
             raise ValueError("max_retries必須為非負整數")
         if self.backoff_factor <= 0:
             raise ValueError("backoff_factor必須為正數")
+        if self.paywall_threshold < 0:
+            raise ValueError("paywall_threshold必須為非負整數")
 
 @dataclass
 class Article:
@@ -557,8 +560,18 @@ class JsonInputProcessor:
         urls = []
         # 從多種可能的數據結構中提取URL
         if isinstance(data, dict):
+            # 處理包含"urls"鍵的結構
+            if 'urls' in data:
+                for item in data['urls']:
+                    if 'url' in item:
+                        urls.append({
+                            'url': item['url'],
+                            'title': TextUtils.clean_text(item.get('title', '')),
+                            'id': item.get('id', ''),
+                            'author': item.get('author', '')
+                        })
             # CSDN API響應格式
-            if 'result_vos' in data:
+            elif 'result_vos' in data:
                 for item in data['result_vos']:
                     if 'url' in item:
                         urls.append({
@@ -1069,6 +1082,15 @@ class CSDNContentExtractor(ContentExtractor):
         
         content_container = best_container
         
+        # 完全移除所有不需要的UI元素，確保它們的內容（包括圖片）都不會被處理
+        # 1. 移除文章信息框
+        for article_info_box in soup.select('.article-info-box'):
+            article_info_box.decompose()  # 從DOM中完全移除整個元素
+            
+        # 2. 移除專欄廣告
+        for column_advert in soup.select('#blogColumnPayAdvert'):
+            column_advert.decompose()  # 從DOM中完全移除整個元素
+        
         if content_container:
             # 識別並處理付費牆限制的內容
             if result['is_paywall']:
@@ -1356,17 +1378,20 @@ class WebScraper:
     
     def scrape_url(self, url_data: Dict[str, Any]) -> Optional[Article]:
         """
-        爬取單個URL的內容
+        爬取單個URL並處理內容
         
         參數:
-            url_data: URL元數據
+            url_data: 包含URL和元數據的字典
             
         返回:
-            爬取的Article對象，失敗則返回None
+            處理後的Article對象，失敗時返回None
         """
-        url = url_data['url']
-        start_time = time.time()
-        
+        url = url_data.get('url', '')
+        if not url:
+            logger.error("遇到空URL，跳過")
+            return None
+            
+        # 創建文章對象
         article = Article(
             url=url,
             title=url_data.get('title', ''),
@@ -1375,115 +1400,84 @@ class WebScraper:
         )
         
         try:
-            logger.info(f"正在爬取URL: {url}")
+            # 更新域名統計
             self.stats.update_domain_stats(url)
             
-            # 限速控制
+            # 應用速率限制
             self.rate_limiter.wait(url)
             
+            # 記錄開始時間
+            start_time = time.time()
+            
             # 使用重試機制請求頁面
-            html, response = self.retry_handler.execute_with_retry(self._request_page, url)
+            html, response = self.retry_handler.execute_with_retry(
+                self._request_page, url
+            )
+            
+            # 計算下載時間
+            article.download_time = time.time() - start_time
             
             # 解析HTML
             soup = BeautifulSoup(html, 'html.parser')
             
-            # 檢測付費牆 - 改進版本，支持兩種返回格式
-            try:
-                # 智能解包：接收三元組或雙元組返回值
-                result = self.paywall_detector.detect(soup, html, url)
-                
-                if isinstance(result, tuple):
-                    if len(result) == 3:
-                        is_paywall, paywall_score, paywall_details = result
-                    elif len(result) == 2:
-                        is_paywall, paywall_score = result
-                        paywall_details = {}
-                    else:
-                        # 未知元組大小，使用保守值
-                        logger.warning(f"付費牆檢測返回了未知格式: {result}")
-                        is_paywall = bool(result[0]) if result else False
-                        paywall_score = 0
-                        paywall_details = {}
-                else:
-                    # 非元組返回值，使用保守方式處理
-                    is_paywall = bool(result)
-                    paywall_score = 0
-                    paywall_details = {}
-                
-                # 更新文章信息
-                article.is_paywall = is_paywall
-                article.paywall_score = paywall_score
-                article.paywall_details = paywall_details
-                
-                if is_paywall:
-                    self.stats.paywall_count += 1
-                    # 增強日誌，包含詳細的檢測信息
-                    logger.warning(f"檢測到付費牆 (分數: {paywall_score}): {url}")
-                    
-                    # 記錄首要的檢測特徵（如果可用）
-                    primary_signal = None
-                    if isinstance(paywall_details, dict):
-                        # 尋找最具指示性的信號
-                        for signal_type in ['structure_signals', 'selector_signals', 'text_signals']:
-                            if signal_type in paywall_details and paywall_details[signal_type]:
-                                primary_signal = paywall_details[signal_type][0]
-                                break
-                    
-                    if primary_signal:
-                        logger.debug(f"付費牆主要特徵: {primary_signal}")
-                
-            except ValueError as e:
-                # 處理解包錯誤 - 可能是接口變更
-                logger.error(f"付費牆檢測返回值解包錯誤: {e}")
-                article.is_paywall = False  # 保守處理
-            except Exception as e:
-                # 處理通用錯誤
-                logger.error(f"付費牆檢測出錯: {e}")
-                article.is_paywall = False  # 保守處理
+            # 檢測付費牆
+            is_paywall, paywall_score, paywall_details = self.paywall_detector.detect(
+                soup, html, url
+            )
             
-            # 如果標題為空，嘗試從頁面提取
-            if not article.title:
-                title_tag = soup.find('title')
-                if title_tag:
-                    article.title = title_tag.text.strip()
+            article.is_paywall = is_paywall
+            article.paywall_score = paywall_score
+            article.paywall_details = paywall_details
             
-            # 選擇適合的內容提取器並提取內容
+            # 如果付費牆得分超過閾值，跳過內容提取
+            if is_paywall and paywall_score >= self.config.paywall_threshold:
+                logger.warning(f"檢測到付費牆 (得分: {paywall_score})，跳過內容提取: {url}")
+                self.stats.paywall_count += 1
+                return article
+                
+            # 根據URL選擇合適的內容提取器
             extractor = self.content_extractor_factory.get_extractor(url, soup)
+            
+            # 提取內容
             extracted_data = extractor.extract(url, soup, html)
             
-            # 更新文章信息
+            # 更新文章對象
             if not article.title and extracted_data.get('title'):
-                article.title = extracted_data['title']
+                article.title = extracted_data.get('title')
             if not article.author and extracted_data.get('author'):
-                article.author = extracted_data['author']
+                article.author = extracted_data.get('author')
             article.content = extracted_data.get('content', '')
-            article.publish_date = extracted_data.get('publish_date', '')
             article.html = html
+            article.publish_date = extracted_data.get('publish_date', '')
             article.text_length = len(article.content)
+            
+            # 檢查內容長度
+            if article.text_length < self.config.min_content_length and not article.is_paywall:
+                logger.warning(f"內容長度過短 ({article.text_length} 字符)，可能提取失敗: {url}")
             
             # 下載圖片（如果配置允許）
             if self.config.download_images and extracted_data.get('images'):
-                self._download_article_images(article, extracted_data['images'])
+                self._download_article_images(article, extracted_data.get('images', []))
             
-            # 計算統計
-            article.download_time = time.time() - start_time
-            
-            # 更新全局統計
+            # 更新統計
             self.stats.successful_urls += 1
+            if article.is_paywall:
+                self.stats.paywall_count += 1
             
+            logger.info(f"成功爬取 URL: {url} (標題: {article.title[:30]}..., 長度: {article.text_length})")
             return article
-        
+            
         except Exception as e:
             self.stats.failed_urls += 1
             self.stats.update_error_stats(type(e).__name__)
-            
+                
             error_msg = f"{type(e).__name__}: {str(e)}"
             logger.error(f"爬取URL {url} 時出錯: {error_msg}")
-            
+                
             # 保存錯誤信息到文章對象
             article.error = error_msg
             return article
-        
+            
         finally:
             # 強制延遲，確保不會太快請求下一個URL
             time.sleep(self.config.delay)
@@ -1565,10 +1559,18 @@ class WebScraper:
             保存的文件路徑，失敗則返回None
         """
         try:
-            # 生成文件名（考慮付費牆標記）
+            # 如果是因為付費牆分數過高而跳過的文章，使用特殊標記
+            paywall_suffix = ""
+            if article.is_paywall:
+                if article.paywall_score >= self.config.paywall_threshold:
+                    paywall_suffix = "付費內容_未抓取"
+                else:
+                    paywall_suffix = "付費內容"
+            
+            # 生成文件名
             filename = TextUtils.generate_filename(
                 article, 
-                "付費內容" if article.is_paywall else ""
+                paywall_suffix
             )
             filepath = os.path.join(self.config.output_dir, filename)
             
@@ -1584,6 +1586,8 @@ class WebScraper:
                 content.append(f"⚠️ 警告: 此文章可能需要付費訂閱才能完整閱讀 ⚠️\n")
                 if article.paywall_score > 0:
                     content.append(f"付費牆檢測評分: {article.paywall_score}\n")
+                    if article.paywall_score >= self.config.paywall_threshold:
+                        content.append(f"⚠️ 付費牆分數超過閾值 ({self.config.paywall_threshold})，已跳過內容抓取 ⚠️\n")
             
             content.append("-" * 80 + "\n\n")
             
@@ -1727,11 +1731,14 @@ def parse_arguments():
     parser.add_argument("--timeout", type=int, default=30, help="請求超時秒數")
     parser.add_argument("--retries", type=int, default=3, help="請求失敗時的最大重試次數")
     parser.add_argument("--no-images", action="store_true", help="不下載圖片")
+    parser.add_argument("--images", action="store_true", help="下載圖片 (優先於 --no-images)")
     parser.add_argument("--proxy", help="使用代理伺服器 (格式: http://user:pass@host:port)")
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO", help="日誌級別")
+    parser.add_argument("--paywall-threshold", type=int, default=30, help="付費牆閾值，超過此值不抓取內容")
     
     return parser.parse_args()
 
+# 修改主函數，處理新增的命令行參數
 def main():
     """主函數"""
     # 解析命令行參數
@@ -1742,16 +1749,24 @@ def main():
     for handler in logger.handlers:
         handler.setLevel(log_level)
     
+    # 處理圖片下載設置 (--images 優先於 --no-images)
+    download_images = True
+    if args.no_images and not args.images:
+        download_images = False
+    if args.images:
+        download_images = True
+    
     # 創建配置
     config = ScrapingConfig(
         input_file=args.input,
         output_dir=args.output,
         max_workers=args.workers,
         delay=args.delay,
-        download_images=not args.no_images,
+        download_images=download_images,
         timeout=args.timeout,
         max_retries=args.retries,
-        proxy=args.proxy
+        proxy=args.proxy,
+        paywall_threshold=args.paywall_threshold
     )
     
     # 創建並運行爬蟲
@@ -1763,9 +1778,17 @@ def main():
     print(f"總共保存的檔案數: {len(saved_files)}")
     if saved_files:
         print(f"檔案保存在: {os.path.abspath(config.output_dir)}")
+        
+        # 分析不同類型的文件
         paywall_files = [f for f in saved_files if "_付費內容" in os.path.basename(f)]
-        if paywall_files:
-            print(f"檢測到 {len(paywall_files)} 個付費文章，已在檔案名中標記。")
+        skipped_paywall_files = [f for f in saved_files if "_付費內容_未抓取" in os.path.basename(f)]
+        
+        if skipped_paywall_files:
+            print(f"檢測到 {len(skipped_paywall_files)} 個高度付費文章 (評分 >= {config.paywall_threshold})，未抓取內容。")
+        
+        if paywall_files and len(paywall_files) > len(skipped_paywall_files):
+            normal_paywall_count = len(paywall_files) - len(skipped_paywall_files)
+            print(f"檢測到 {normal_paywall_count} 個付費文章 (評分 < {config.paywall_threshold})，已抓取內容。")
 
 if __name__ == "__main__":
     try:
