@@ -1,0 +1,41 @@
+# Core HTTP & Network Libraries
+requests>=2.28.1
+aiohttp>=3.8.3
+urllib3>=1.26.12
+
+# HTML Processing
+beautifulsoup4>=4.11.1
+lxml>=4.9.1  # 高效XML/HTML解析器，BeautifulSoup的推薦後端
+
+# Asynchronous Programming
+asyncio>=3.4.3  # Python 3.7+ 已內建，但顯式列出以確保依賴完整性
+
+# Browser Automation
+selenium>=4.5.0
+webdriver-manager>=3.8.4  # 自動化WebDriver版本管理
+
+# System Monitoring & Performance
+psutil>=5.9.2  # 系統資源監控
+
+# Data Processing & Serialization
+pandas>=1.5.0  # 可選：用於數據分析
+numpy>=1.23.3  # 可選：科學計算基礎庫
+
+# Utilities
+tqdm>=4.64.1  # 進度條顯示
+python-dateutil>=2.8.2  # 日期時間處理
+pytz>=2022.4  # 時區處理
+
+# Logging & Monitoring
+colorlog>=6.7.0  # 彩色日誌輸出，提高可讀性
+
+# Type Checking (Development)
+typing-extensions>=4.3.0  # 增強型類型提示，支持Python 3.7+
+mypy>=0.971  # 可選：靜態類型檢查
+
+# Testing (Development)
+pytest>=7.0.0  # 可選：單元測試框架
+pytest-asyncio>=0.19.0  # 可選：asyncio測試支持
+
+# Security (Optional)
+cryptography>=38.0.1  # 可選：加密功能支持
