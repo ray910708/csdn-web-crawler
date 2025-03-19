@@ -18,12 +18,12 @@ import argparse
 import math
 import hashlib
 from urllib.parse import quote
-from typing import Dict, Set, List
+from typing import Dict, Set, List, Optional, Any, Tuple
 import asyncio
 import aiohttp
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime
 import queue
 from pathlib import Path
@@ -32,6 +32,9 @@ import psutil  # 若未安裝，需執行 pip install psutil
 import glob
 import re
 import shutil
+import threading  # 添加threading模塊導入
+import signal  # 添加signal模塊導入
+import sys
 
 # 尝试导入selenium相关库
 try:
@@ -75,6 +78,101 @@ if sys.platform == 'win32':
 
 # 全局计数器，用于自适应请求策略
 request_count = 0
+
+# 全局事件，用于控制后台线程
+stop_backup_thread = threading.Event()
+stop_stats_update = threading.Event()
+
+# 添加終止程序的標記
+program_terminated = threading.Event()
+
+def terminate_threads():
+    """安全終止所有執行緒"""
+    # 設置所有停止標誌
+    stop_backup_thread.set()
+    stop_stats_update.set()
+    program_terminated.set()
+    
+    # 使用結構化方式等待執行緒結束
+    threads_to_wait = []
+    if 'backup_thread' in globals() and backup_thread.is_alive():
+        threads_to_wait.append(('備份執行緒', backup_thread))
+    if 'stats_thread' in locals() or 'stats_thread' in globals():
+        if 'stats_thread' in locals() and stats_thread.is_alive():
+            threads_to_wait.append(('統計執行緒', stats_thread))
+        elif 'stats_thread' in globals() and stats_thread.is_alive():
+            threads_to_wait.append(('統計執行緒', stats_thread))
+    
+    # 等待所有執行緒，最多3秒
+    for name, thread in threads_to_wait:
+        logger.info(f"等待{name}終止...")
+        thread.join(timeout=3)
+        if thread.is_alive():
+            logger.warning(f"{name}未能在3秒內終止，將繼續執行結束程序")
+    
+    logger.info("所有執行緒已通知終止")
+
+async def cleanup_async_resources():
+    """完整清理所有異步資源"""
+    tasks = []
+    
+    # 收集所有需要關閉的異步資源
+    # 檢查 fetcher 是否存在且有 session 屬性
+    if 'fetcher' in locals() or 'fetcher' in globals():
+        fetcher_obj = locals().get('fetcher') if 'fetcher' in locals() else globals().get('fetcher')
+        if hasattr(fetcher_obj, 'session') and fetcher_obj.session is not None:
+            tasks.append(fetcher_obj.close_session())
+    
+    # 設置超時確保不會無限等待
+    try:
+        if tasks:
+            logger.info(f"開始清理 {len(tasks)} 個異步資源...")
+            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5)
+            logger.info("所有異步資源已成功關閉")
+    except asyncio.TimeoutError:
+        logger.warning("異步資源關閉超時，將強制結束")
+    except Exception as e:
+        logger.error(f"清理異步資源時出錯: {e}")
+
+def terminate_event_loop(loop):
+    """安全關閉事件循環"""
+    if loop is None or loop.is_closed():
+        return
+        
+    try:
+        # 取消所有懸掛任務
+        pending = asyncio.all_tasks(loop=loop)
+        if pending:
+            logger.info(f"取消 {len(pending)} 個懸掛的異步任務")
+            for task in pending:
+                task.cancel()
+            
+            # 使用新的事件循環運行取消操作
+            loop.run_until_complete(
+                asyncio.gather(*pending, return_exceptions=True)
+            )
+        
+        # 正確關閉循環
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+        logger.info("事件循環已安全關閉")
+    except Exception as e:
+        logger.error(f"關閉事件循環時出錯: {e}")
+
+def register_signal_handlers():
+    """註冊信號處理器以實現優雅退出"""
+    
+    def signal_handler(sig, frame):
+        logger.info(f"收到信號 {sig}，開始優雅退出程序...")
+        # 設置所有停止標誌
+        stop_backup_thread.set()
+        stop_stats_update.set()
+        program_terminated.set()
+        # 不立即終止，讓主程序的finally區塊處理清理
+    
+    # 註冊SIGINT和SIGTERM處理器
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
 def generate_headers() -> Dict[str, str]:
     """生成随机化的请求头，降低被拦截风险"""
@@ -241,20 +339,33 @@ def debug_csdn_search_dynamic(query: str, output_dir: str = "debug_output", star
     # 启动异步处理任务
     processing_task = loop.create_task(process_url_queue())
     
-    # 保存URL到备份文件的函数
+    # 保存URL到備份文件的函數
     def save_urls_to_backup():
         try:
+            if program_terminated.is_set():
+                logger.info("程序已標記為終止，跳過文本格式URL備份")
+                return
+                
+            # 確保目錄存在
+            backup_dir = os.path.dirname(url_backup_file)
+            if not os.path.exists(backup_dir):
+                os.makedirs(backup_dir, exist_ok=True)
+                
             with open(url_backup_file, "w", encoding="utf-8") as f:
                 for url in article_urls:
                     f.write(f"{url}\n")
-            logger.info(f"已将 {len(article_urls)} 个URL保存到备份文件")
+            logger.info(f"已將 {len(article_urls)} 個URL保存到備份文件")
         except Exception as e:
-            logger.error(f"保存URL到备份文件时出错: {e}")
+            logger.error(f"保存URL到備份文件時出錯: {e}")
     
-    # 保存URL到JSON备份文件的函数
+    # 保存URL到JSON備份文件的函數
     def save_urls_to_backup_json():
         try:
-            # 构建备份数据结构
+            if program_terminated.is_set():
+                logger.info("程序已標記為終止，跳過URL備份")
+                return
+                
+            # 構建備份數據結構
             backup_data = {
                 "metadata": {
                     "timestamp": datetime.now().isoformat(),
@@ -278,20 +389,34 @@ def debug_csdn_search_dynamic(query: str, output_dir: str = "debug_output", star
                 ]
             }
             
-            # 使用JSON格式写入文件
+            # 使用JSON格式寫入文件前檢查目錄是否存在
+            backup_dir = os.path.dirname(url_backup_file_json)
+            if not os.path.exists(backup_dir):
+                os.makedirs(backup_dir, exist_ok=True)
+                
+            # 使用JSON格式寫入文件
             with open(url_backup_file_json, "w", encoding="utf-8") as f:
                 json.dump(backup_data, f, ensure_ascii=False, indent=2)
                 
-            logger.info(f"已将 {len(article_urls)} 个URL以JSON格式保存到备份文件")
+            logger.info(f"已將 {len(article_urls)} 個URL以JSON格式保存到備份文件")
         except Exception as e:
             logger.error(f"保存URL到JSON備份文件時出錯: {e}")
-            # 尝试使用文本格式作为后备方案
-            save_urls_to_backup()
-    
+            # 嘗試使用文本格式作為後備方案
+            try:
+                save_urls_to_backup()
+            except Exception as backup_error:
+                logger.error(f"備份到文本文件也失敗: {backup_error}")
+            
     # 定期保存URL的函数
+    # 使用全局變量，不需要重新定義
     def periodic_url_backup():
-        while True:
-            time.sleep(30)  # 每30秒保存一次
+        while not stop_backup_thread.is_set() and not program_terminated.is_set():  # 檢查停止事件和程序終止事件
+            # 使用更短的等待時間來更快地回應停止請求
+            for _ in range(6):  # 6次檢查，每次5秒，總共約30秒
+                if stop_backup_thread.wait(5) or program_terminated.wait(0):
+                    logger.info("備份線程接收到停止信號")
+                    return  # 如果收到停止信號，立即返回
+                
             # 根据URL数量选择合适的备份策略
             if len(article_urls) > 10000:
                 compressed_json_backup()
@@ -301,9 +426,10 @@ def debug_csdn_search_dynamic(query: str, output_dir: str = "debug_output", star
                 save_urls_to_backup_json()
                 # 同时保留文本备份作为后备
                 save_urls_to_backup()
+        
+        logger.info("URL備份線程已停止")
     
     # 启动定期保存URL的线程
-    import threading
     backup_thread = threading.Thread(target=periodic_url_backup, daemon=True)
     backup_thread.start()
     
@@ -396,16 +522,20 @@ def debug_csdn_search_dynamic(query: str, output_dir: str = "debug_output", star
     
     # 压缩JSON备份
     def compressed_json_backup():
+        """使用gzip壓縮備份大量URL"""
         try:
-            import gzip
-            
+            if program_terminated.is_set():
+                logger.info("程序已標記為終止，跳過壓縮URL備份")
+                return
+                
+            # 構建備份數據
             backup_data = {
                 "metadata": {
                     "timestamp": datetime.now().isoformat(),
                     "total_urls": len(article_urls),
                     "query": query,
-                    "compressed": True,
-                    "version": "1.1",
+                    "version": "1.0",
+                    "compression": "gzip",
                     "scraping_stats": {
                         "processed": len(processed_urls),
                         "success_count": fetcher.success_count,
@@ -417,25 +547,43 @@ def debug_csdn_search_dynamic(query: str, output_dir: str = "debug_output", star
                     {
                         "url": url,
                         "discovered_at": url_discovery_times.get(url, datetime.now().isoformat()),
-                        "processed": url in processed_urls,
-                        "retry_count": getattr(url, '_retry_count', 0) if hasattr(url, '_retry_count') else 0
+                        "processed": url in processed_urls
                     } for url in article_urls
                 ]
             }
             
-            # 序列化为JSON字符串
-            json_str = json.dumps(backup_data, ensure_ascii=False)
-            
-            # 使用gzip压缩
+            # 備份文件名
             compressed_file = url_backup_file_json + ".gz"
-            with gzip.open(compressed_file, "wt", encoding="utf-8") as f:
-                f.write(json_str)
+            
+            # 壓縮並寫入
+            json_str = json.dumps(backup_data, ensure_ascii=False)
+            json_bytes = json_str.encode('utf-8')
+            
+            # 確保目錄存在
+            backup_dir = os.path.dirname(compressed_file)
+            if not os.path.exists(backup_dir):
+                os.makedirs(backup_dir, exist_ok=True)
                 
-            logger.info(f"已将 {len(article_urls)} 个URL以压缩JSON格式保存")
+            with gzip.open(compressed_file, 'wb') as f:
+                f.write(json_bytes)
+                
+            logger.info(f"已將 {len(article_urls)} 個URL以壓縮格式保存到 {compressed_file}")
+            
+            # 同時生成普通JSON備份作為索引
+            with open(url_backup_file_json, "w", encoding="utf-8") as f:
+                # 只保留元數據，不包含URL列表
+                index_data = backup_data["metadata"]
+                index_data["compression_file"] = os.path.basename(compressed_file)
+                index_data["total_urls"] = len(article_urls)
+                json.dump(index_data, f, ensure_ascii=False, indent=2)
+                
         except Exception as e:
-            logger.error(f"压缩JSON备份时出错: {e}")
-            # 尝试非压缩备份
-            save_urls_to_backup_json()
+            logger.error(f"壓縮備份URL時出錯: {e}")
+            # 嘗試使用標準JSON備份
+            try:
+                save_urls_to_backup_json()
+            except Exception as backup_error:
+                logger.error(f"標準備份也失敗: {backup_error}")
     
     try:
         options = Options()
@@ -724,8 +872,8 @@ def debug_csdn_search_dynamic(query: str, output_dir: str = "debug_output", star
         logger.info("等待队列中的URL处理完成...")
         loop.run_until_complete(url_queue.put(None))  # 发送结束信号
         
-        # 設置更長的超時時間，並添加進度報告
-        timeout_min = args.url_timeout if hasattr(args, 'url_timeout') and args.url_timeout > 0 else 30  # 預設30分鐘
+        # 設置超時時間為1分鐘，並添加進度報告
+        timeout_min = args.url_timeout if hasattr(args, 'url_timeout') and args.url_timeout > 0 else 1  # 預設1分鐘
         timeout_sec = timeout_min * 60
         logger.info(f"設置URL處理超時為 {timeout_min} 分鐘")
         
@@ -827,11 +975,40 @@ def debug_csdn_search_dynamic(query: str, output_dir: str = "debug_output", star
     finally:
         # 關閉異步事件循環
         try:
-            loop.run_until_complete(fetcher.close_session())
-            loop.close()
+            # 首先停止備份線程
+            stop_backup_thread.set()
+            logger.info("已從處理函數發送停止信號給URL備份線程")
+            
+            # 等待備份線程終止（最多等待2秒）
+            if 'backup_thread' in locals() or 'backup_thread' in globals():
+                bt = backup_thread if 'backup_thread' in locals() else globals().get('backup_thread')
+                if bt and bt.is_alive():
+                    bt.join(timeout=2)
+                    if bt.is_alive():
+                        logger.warning("備份線程未能在2秒內終止")
+            
+            # 清理異步資源
+            try:
+                loop.run_until_complete(fetcher.close_session())
+            except Exception as e:
+                logger.error(f"關閉異步會話時出錯: {e}")
+            
+            # 關閉事件循環
+            terminate_event_loop(loop)
         except Exception as e:
             logger.error(f"关闭异步事件循环时出错: {e}")
-            
+        
+        # 如果函數是直接被調用而不是通過main函數，也要停止統計線程
+        if 'args' in globals() and hasattr(args, 'monitor_interval') and args.monitor_interval > 0:
+            stop_stats_update.set()
+            logger.info("已從處理函數發送停止信號給統計更新線程")
+        
+        # 如果是直接調用這個函數（不是通過主程序調用），確保程序退出
+        if __name__ != "__main__":
+            logger.info("處理函數直接退出程序")
+            terminate_threads()  # 確保所有線程得到終止信號
+            sys.exit(0)
+
 def debug_csdn_search_api(query: str, output_dir: str = "debug_output", start_index: int = 0, article_count: int = None) -> bool:
     """尝试直接调用CSDN搜索API，可指定文章范围"""
     logger.info(f"开始尝试API请求调试 CSDN 搜索: {query} [文章范围: {start_index} 起始, 数量 {article_count if article_count else '全部'}]")
@@ -2053,225 +2230,6 @@ class URLShardManager:
         except Exception as e:
             logger.error(f"更新分片索引時出錯: {e}")
 
-def migrate_data_from_articlesjsonl(output_dir: str) -> bool:
-    """
-    將articles.jsonl數據遷移至collected_urls.json或分片結構
-    
-    Args:
-        output_dir: 輸出目錄路徑
-        
-    Returns:
-        遷移是否成功
-    """
-    articles_file = os.path.join(output_dir, "articles.jsonl")
-    urls_file = os.path.join(output_dir, "collected_urls.json")
-    
-    if not os.path.exists(articles_file):
-        logger.info("無articles.jsonl檔案，無需遷移")
-        return False
-    
-    logger.info(f"開始將數據從 {articles_file} 遷移到URL結構")
-    start_time = time.time()
-    
-    # 載入articles.jsonl
-    articles_data = []
-    hash_set = set()  # 用於去重
-    try:
-        with open(articles_file, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    article = json.loads(line)
-                    if "content_hash" in article and article["content_hash"] not in hash_set:
-                        articles_data.append(article)
-                        hash_set.add(article["content_hash"])
-                except json.JSONDecodeError:
-                    continue
-    except Exception as e:
-        logger.error(f"載入articles.jsonl出錯: {e}")
-        return False
-    
-    logger.info(f"已載入 {len(articles_data)} 篇文章，共 {len(hash_set)} 個唯一雜湊")
-    
-    # 檢查URL檔案是否已分片
-    is_sharded = False
-    try:
-        if os.path.exists(urls_file):
-            with open(urls_file, "r", encoding="utf-8") as f:
-                urls_data = json.load(f)
-                is_sharded = urls_data.get("is_sharded", False)
-    except Exception as e:
-        logger.error(f"檢查URL檔案分片狀態出錯: {e}")
-    
-    if is_sharded:
-        # 使用分片結構處理
-        logger.info("URL檔案已分片，將使用分片結構進行遷移")
-        return migrate_to_sharded_structure(output_dir, articles_data)
-    else:
-        # 使用單一檔案處理
-        logger.info("URL檔案未分片，將遷移到單一檔案")
-        return migrate_to_single_file(output_dir, articles_data)
-
-def migrate_to_single_file(output_dir: str, articles_data: List[dict]) -> bool:
-    """將文章數據遷移到單一collected_urls.json檔案"""
-    urls_file = os.path.join(output_dir, "collected_urls.json")
-    
-    # 載入現有collected_urls.json
-    urls_data = {"metadata": {}, "urls": []}
-    try:
-        if os.path.exists(urls_file):
-            with open(urls_file, "r", encoding="utf-8") as f:
-                urls_data = json.load(f)
-    except Exception as e:
-        logger.error(f"載入collected_urls.json出錯: {e}")
-        # 創建新的結構
-        urls_data = {"metadata": {}, "urls": []}
-    
-    # 建立URL映射
-    url_map = {}
-    for url_entry in urls_data.get("urls", []):
-        if "url" in url_entry:
-            url_map[url_entry["url"]] = url_entry
-    
-    # 合併數據
-    update_count = 0
-    new_count = 0
-    
-    for article in articles_data:
-        if "url" in article and article["url"]:
-            if article["url"] in url_map:
-                # 更新既有URL
-                url_map[article["url"]].update({
-                    "content_hash": article.get("content_hash", ""),
-                    "title": article.get("title", ""),
-                    "author": article.get("author", ""),
-                    "processed": True,
-                    "success": True,
-                    "text_sample": article.get("text", "")[:500] if "text" in article else "",
-                    "processed_at": article.get("timestamp", datetime.now().isoformat())
-                })
-                update_count += 1
-            else:
-                # 添加新URL
-                urls_data["urls"].append({
-                    "url": article["url"],
-                    "content_hash": article.get("content_hash", ""),
-                    "title": article.get("title", ""),
-                    "author": article.get("author", ""),
-                    "processed": True,
-                    "success": True,
-                    "text_sample": article.get("text", "")[:500] if "text" in article else "",
-                    "discovered_at": article.get("timestamp", datetime.now().isoformat()),
-                    "processed_at": article.get("timestamp", datetime.now().isoformat())
-                })
-                new_count += 1
-    
-    # 更新元數據
-    urls_data["metadata"].update({
-        "timestamp": datetime.now().isoformat(),
-        "migration_date": datetime.now().isoformat(),
-        "total_articles_migrated": len(articles_data),
-        "total_urls_updated": update_count,
-        "total_urls_added": new_count,
-        "total_urls": len(urls_data.get("urls", [])),
-        "total_processed": sum(1 for url in urls_data.get("urls", []) if url.get("processed", False)),
-        "success_count": sum(1 for url in urls_data.get("urls", []) if url.get("processed", False) and url.get("success", False)),
-        "duplicate_count": len(articles_data) - (update_count + new_count) if len(articles_data) > (update_count + new_count) else 0
-    })
-    
-    # 保存更新後的collected_urls.json
-    try:
-        # 備份原檔案
-        if os.path.exists(urls_file):
-            backup_file = urls_file + f".bak.{int(time.time())}"
-            shutil.copy2(urls_file, backup_file)
-            logger.info(f"已備份原URL檔案到 {backup_file}")
-        
-        with open(urls_file, "w", encoding="utf-8") as f:
-            json.dump(urls_data, f, ensure_ascii=False, indent=2)
-        logger.info(f"數據遷移成功，更新 {update_count} 個URL，新增 {new_count} 個URL，總計 {len(urls_data.get('urls', []))} 個URL")
-        
-        # 如果URL數量超過閾值，建議將檔案分片
-        if len(urls_data.get("urls", [])) > 5000:
-            logger.info("URL數量較多，建議使用 create_url_shards() 函數將檔案分片以提高效能")
-            
-        return True
-    except Exception as e:
-        logger.error(f"保存collected_urls.json失敗: {e}")
-        return False
-
-def migrate_to_sharded_structure(output_dir: str, articles_data: List[dict]) -> bool:
-    """將文章數據遷移到分片結構"""
-    try:
-        # 初始化分片管理器
-        shard_manager = URLShardManager(output_dir)
-        
-        # 根據URL更新分片
-        success_count = 0
-        failed_count = 0
-        
-        # 顯示進度
-        total = len(articles_data)
-        progress_step = max(1, total // 20)  # 5%的進度更新
-        
-        for i, article in enumerate(articles_data):
-            if "url" in article and article["url"]:
-                try:
-                    # 構建文章狀態數據
-                    article_data = {
-                        "content_hash": article.get("content_hash", ""),
-                        "title": article.get("title", ""),
-                        "author": article.get("author", ""),
-                        "processed": True,
-                        "success": True,
-                        "text_sample": article.get("text", "")[:500] if "text" in article else "",
-                        "discovered_at": article.get("timestamp", datetime.now().isoformat()),
-                        "processed_at": article.get("timestamp", datetime.now().isoformat())
-                    }
-                    
-                    # 更新URL狀態
-                    success = shard_manager.update_url(article["url"], article_data)
-                    if not success:
-                        # 嘗試添加新URL
-                        shard_manager.add_url(article["url"], {"url": article["url"], **article_data})
-                    
-                    success_count += 1
-                except Exception as e:
-                    logger.error(f"更新URL分片時出錯: {article['url']}, {e}")
-                    failed_count += 1
-            
-            # 顯示進度
-            if (i + 1) % progress_step == 0 or i + 1 == total:
-                progress_percent = (i + 1) / total * 100
-                logger.info(f"遷移進度: {i+1}/{total} ({progress_percent:.1f}%), 成功: {success_count}, 失敗: {failed_count}")
-        
-        # 更新分片索引中的統計資訊
-        index_file = os.path.join(output_dir, "url_shard_index.json")
-        if os.path.exists(index_file):
-            try:
-                with open(index_file, "r", encoding="utf-8") as f:
-                    index_data = json.load(f)
-                
-                # 更新統計資訊
-                index_data.update({
-                    "last_updated": datetime.now().isoformat(),
-                    "migration_date": datetime.now().isoformat(),
-                    "total_articles_migrated": len(articles_data),
-                    "migration_success_count": success_count,
-                    "migration_failed_count": failed_count
-                })
-                
-                with open(index_file, "w", encoding="utf-8") as f:
-                    json.dump(index_data, f, ensure_ascii=False, indent=2)
-            except Exception as e:
-                logger.error(f"更新分片索引統計資訊時出錯: {e}")
-        
-        logger.info(f"分片結構遷移完成: 處理 {total} 篇文章, 成功 {success_count}, 失敗 {failed_count}")
-        return success_count > 0
-        
-    except Exception as e:
-        logger.error(f"遷移到分片結構時出錯: {e}")
-        return False
-
 def create_url_shards(output_dir: str, shard_size: int = 5000) -> bool:
     """
     將單一collected_urls.json檔案轉換為分片結構
@@ -2316,66 +2274,35 @@ def create_url_shards(output_dir: str, shard_size: int = 5000) -> bool:
 # 刪除articles.jsonl文件的工具函數
 def remove_articles_jsonl(output_dir: str, confirm: bool = False) -> bool:
     """
-    當確認遷移成功後，刪除articles.jsonl檔案
+    此功能已移除 - 不再支持articles.jsonl
     
     Args:
         output_dir: 輸出目錄路徑
-        confirm: 是否確認刪除，不確認則只備份
+        confirm: 是否確認刪除，不再使用
         
     Returns:
-        操作是否成功
+        始終返回True
     """
-    articles_file = os.path.join(output_dir, "articles.jsonl")
+    logger.info("articles.jsonl功能已移除，此函數不再執行任何操作")
+    return True
+
+def migrate_data_from_articlesjsonl(output_dir: str) -> bool:
+    """
+    此功能已移除 - 不再支持articles.jsonl
     
-    if not os.path.exists(articles_file):
-        logger.info("未找到articles.jsonl檔案，無需刪除")
-        return True
-    
-    # 檢查是否有遷移記錄
-    urls_file = os.path.join(output_dir, "collected_urls.json")
-    migration_performed = False
-    
-    try:
-        if os.path.exists(urls_file):
-            with open(urls_file, "r", encoding="utf-8") as f:
-                urls_data = json.load(f)
-                migration_performed = "migration_date" in urls_data.get("metadata", {})
-    except Exception:
-        pass
-    
-    if not migration_performed:
-        index_file = os.path.join(output_dir, "url_shard_index.json")
-        try:
-            if os.path.exists(index_file):
-                with open(index_file, "r", encoding="utf-8") as f:
-                    index_data = json.load(f)
-                    migration_performed = "migration_date" in index_data
-        except Exception:
-            pass
-    
-    if not migration_performed and not confirm:
-        logger.warning("未檢測到遷移記錄，且未強制確認，操作取消")
-        return False
-    
-    try:
-        # 備份原檔案
-        backup_file = articles_file + f".bak.{int(time.time())}"
-        shutil.copy2(articles_file, backup_file)
-        logger.info(f"已備份原articles.jsonl到 {backup_file}")
+    Args:
+        output_dir: 輸出目錄路徑
         
-        if confirm:
-            # 刪除articles.jsonl
-            os.remove(articles_file)
-            logger.info(f"已刪除 {articles_file}")
-            return True
-        else:
-            logger.info(f"由於未確認，僅備份 {articles_file}，未刪除")
-            return True
-    except Exception as e:
-        logger.error(f"處理articles.jsonl時出錯: {e}")
-        return False
+    Returns:
+        始終返回False
+    """
+    logger.info("articles.jsonl功能已移除，此函數不再執行任何操作")
+    return False
 
 if __name__ == "__main__":
+    # 註冊信號處理器
+    register_signal_handlers()
+    
     parser = argparse.ArgumentParser(description="CSDN 搜索調試工具")
     parser.add_argument("--query", default="ip連線", help="搜索查詢詞")
     parser.add_argument("--output-dir", default="debug_output", help="調試輸出目錄")
@@ -2389,39 +2316,41 @@ if __name__ == "__main__":
                       help="URL 備份格式: text=文本, json=JSON, json_compressed=壓縮JSON, all=所有格式")
     parser.add_argument("--benchmark", action="store_true", help="執行 URL 備份性能測試")
     parser.add_argument("--benchmark-count", type=int, default=10000, help="性能測試的 URL 數量")
-    parser.add_argument("--url-timeout", type=int, default=30, help="URL處理超時時間（分鐘），預設30分鐘")
+    parser.add_argument("--url-timeout", type=int, default=1, help="URL處理超時時間（分鐘），預設1分鐘")
     parser.add_argument("--resume", action="store_true", help="自動繼續處理未完成的URL")
     parser.add_argument("--no-resume", dest="resume", action="store_false", help="不自動繼續處理未完成的URL")
     parser.set_defaults(resume=True)
     
     # 新增重構相關命令行選項
-    parser.add_argument("--migrate", action="store_true", help="將articles.jsonl數據遷移到URL結構")
+    parser.add_argument("--migrate", action="store_true", help="[已棄用] 此選項不再有任何功能")
     parser.add_argument("--create-shards", action="store_true", help="將單一URL檔案轉換為分片結構")
     parser.add_argument("--shard-size", type=int, default=5000, help="URL分片大小，預設5000個URL/分片")
-    parser.add_argument("--remove-articles-jsonl", action="store_true", help="刪除articles.jsonl檔案（確認遷移成功後使用）")
-    parser.add_argument("--force-delete", action="store_true", help="強制刪除articles.jsonl，不檢查遷移記錄")
+    parser.add_argument("--remove-articles-jsonl", action="store_true", help="[已棄用] 此選項不再有任何功能")
+    parser.add_argument("--force-delete", action="store_true", help="[已棄用] 此選項不再有任何功能")
     
     args = parser.parse_args()
     
     # 確保輸出目錄存在
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # 處理重構相關操作，優先處理這些操作
-    if args.migrate:
-        logger.info("執行數據遷移操作")
-        migrate_data_from_articlesjsonl(args.output_dir)
-    
+    # 处理分片创建
     if args.create_shards:
         logger.info(f"創建URL分片，每個分片 {args.shard_size} 個URL")
         create_url_shards(args.output_dir, args.shard_size)
+        logger.info("執行重構相關操作完成，程式結束")
+        sys.exit(0)
+    
+    # 其他命令行選項的處理
+    # 注意：--migrate和--remove-articles-jsonl將不執行實際操作，只保留為了向後兼容
+    if args.migrate:
+        logger.info("articles.jsonl功能已移除，--migrate選項不再執行任何操作")
     
     if args.remove_articles_jsonl:
-        logger.info("處理articles.jsonl檔案")
-        remove_articles_jsonl(args.output_dir, args.force_delete)
+        logger.info("articles.jsonl功能已移除，--remove-articles-jsonl選項不再執行任何操作")
     
     # 如果只進行重構相關操作，則不執行爬蟲
-    if args.migrate or args.create_shards or args.remove_articles_jsonl:
-        logger.info("執行重構相關操作完成，程式結束")
+    if args.migrate or args.remove_articles_jsonl:
+        logger.info("重構相關操作已不再支持，程式結束")
         sys.exit(0)
     
     # 檢查是否運行性能測試
@@ -2443,10 +2372,14 @@ if __name__ == "__main__":
     # 創建監控器實例 - 使用重構後的類
     monitor = ArticleMonitor(args.output_dir)
     
-    # 啟動監控統計信息更新的後台線程
+    # 定義統計更新函數，使用全局變量
     def update_stats_periodically():
-        while True:
-            time.sleep(args.monitor_interval)
+        while not stop_stats_update.is_set() and not program_terminated.is_set():  # 檢查停止事件和程序終止事件
+            # 使用wait代替sleep，這樣可以更快地響應停止請求
+            if stop_stats_update.wait(args.monitor_interval / 6) or program_terminated.wait(0):  # 每次等待時間為監控間隔的六分之一
+                logger.info("統計更新線程接收到停止信號")
+                break  # 如果收到停止信號，立即退出
+            
             try:
                 monitor.update_stats()
                 
@@ -2484,9 +2417,10 @@ if __name__ == "__main__":
                               f"發現 {monitor.duplicate_articles} 篇重複文章")
             except Exception as e:
                 logger.error(f"定期更新統計信息時出錯: {e}")
+        
+        logger.info("統計更新線程已停止")
     
     if args.monitor_interval > 0:
-        import threading
         stats_thread = threading.Thread(target=update_stats_periodically, daemon=True)
         stats_thread.start()
     
@@ -2502,7 +2436,7 @@ if __name__ == "__main__":
         
         # 更新最終統計
         monitor.update_stats()
-        
+        logger.info("調試完成")
     except KeyboardInterrupt:
         logger.info("接收到中斷信號，正在保存當前進度...")
         monitor.update_stats()
@@ -2510,4 +2444,38 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"程序執行出錯: {e}", exc_info=True)
     finally:
-        logger.info("調試完成")
+        try:
+            # 1. 終止執行緒
+            terminate_threads()
+            
+            # 2. 清理異步資源
+            if 'loop' in locals():
+                if not loop.is_closed() and loop.is_running():
+                    cleanup_task = asyncio.run_coroutine_threadsafe(cleanup_async_resources(), loop)
+                    try:
+                        # 給清理任務5秒時間
+                        cleanup_task.result(5)
+                    except Exception as e:
+                        logger.error(f"清理異步資源時出錯: {e}")
+                elif not loop.is_closed():
+                    # 如果循環未運行，使用新的循環執行清理
+                    try:
+                        temp_loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(temp_loop)
+                        temp_loop.run_until_complete(cleanup_async_resources())
+                        temp_loop.close()
+                    except Exception as e:
+                        logger.error(f"使用臨時循環清理資源時出錯: {e}")
+            
+            # 3. 安全關閉事件循環
+            if 'loop' in locals() and not loop.is_closed():
+                terminate_event_loop(loop)
+            
+            logger.info("程序資源已完全清理，準備正常退出")
+        except Exception as e:
+            logger.error(f"最終清理過程中出錯: {e}")
+        finally:
+            # 確保程序退出
+            logger.info("強制結束程序")
+            # 使用os._exit作為最後手段，確保程序退出
+            os._exit(0)
