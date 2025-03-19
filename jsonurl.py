@@ -1724,7 +1724,7 @@ def parse_arguments():
     import argparse
     
     parser = argparse.ArgumentParser(description="JSON URL爬蟲工具")
-    parser.add_argument("--input", default="./debug_output/filtered_api_response_0.json", help="包含URL的JSON輸入文件")
+    parser.add_argument("--input", default="./debug_output/collected_urls.json", help="包含URL的JSON輸入文件")
     parser.add_argument("--output", default="./debug_output/scraped_articles", help="爬取內容的輸出目錄")
     parser.add_argument("--workers", type=int, default=3, help="最大並行工作數")
     parser.add_argument("--delay", type=float, default=2.0, help="請求間的延遲秒數")
