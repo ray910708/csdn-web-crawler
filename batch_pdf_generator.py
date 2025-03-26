@@ -716,68 +716,56 @@ class PDFGenerator:
             else:
                 filename_text = text_file.basename
                 
-            # 将ChineseHeading改为ChineseHeading1
             elements.append(Paragraph(filename_text, self.styles['ChineseHeading1']))
             elements.append(Spacer(0, 0.2*inch))
             
             # 讀取文件內容
             encoding = self._detect_encoding(text_file.path)
+            content = ""
+            title = None
+            
             with open(text_file.path, 'r', encoding=encoding) as f:
-                content = f.read()
+                lines = f.readlines()
+                for line in lines[:20]:  # 检查前20行
+                    line = line.strip()
+                    if line.startswith('标题:') or line.startswith('標題:'):
+                        title = line.split(':', 1)[1].strip()
+                        break
+                    elif line and len(line) > 3 and len(line) < 200:
+                        # 排除看起来像URL或其他非标题内容的行
+                        if not line.startswith(('http', 'www', '#', '/')):
+                            title = line
+                            break
+                content = ''.join(lines)
+            
+            # 如果找到标题，更新输出文件名
+            if title:
+                # 清理标题中的非法字符
+                safe_title = re.sub(r'[<>:"/\\|?*]', '_', title)
+                # 限制文件名长度
+                if len(safe_title.encode('utf-8')) > 200:  # 限制字节长度
+                    safe_title = safe_title[:50]  # 取前50个字符
+                
+                # 构建新的输出文件路径
+                output_dir = os.path.dirname(self.output_file)
+                new_filename = f"{safe_title}.pdf"
+                new_output_path = os.path.join(output_dir, new_filename)
+                
+                # 更新输出文件路径
+                self.output_file = new_output_path
+                # 更新文档标题
+                self.title = title
             
             # 清理文本
             content = self._clean_text(content)
             
-            # 检查特殊格式的图片引用：[图片：图片描述]
+            # 定义图片引用模式
             special_image_pattern = r'\[图片：(.*?)\]'
-            special_matches = re.findall(special_image_pattern, content)
-            
-            # 标准Markdown图片格式: ![alt](path)
             markdown_image_pattern = r'!\[(.*?)\]\((.*?)\)'
-            
-            # 简化的Markdown图片格式: ![](path)
             simple_image_pattern = r'!\[\]\((.*?)\)'
             
-            # 查找所有标准Markdown图片引用
-            markdown_matches = re.findall(markdown_image_pattern, content)
-            logger.debug(f"找到标准Markdown图片引用: {len(markdown_matches)} 个匹配")
-            
-            # 查找所有简化的Markdown图片引用
-            simple_matches = re.findall(simple_image_pattern, content)
-            logger.debug(f"找到简化Markdown图片引用: {len(simple_matches)} 个匹配")
-            
-            # 设置图片映射关系
-            article_id = self.article_id
-            
-            # 构建图片描述到文件的映射
-            image_map = {}
-            
-            # 如果存在图片文件，则自动构建映射关系
-            if hasattr(self, 'current_group') and self.current_group and self.current_group.image_files:
-                # 构建通用映射（用于特殊格式映射）
-                image_descriptions = [
-                    "TCP/IP五层模型图",
-                    "TCP/IP数据传输图",
-                    "TCP和UDP的区别",
-                    "网络层作用",
-                    "数据链路层",
-                    "物理层作用",
-                    "物理设备定义"
-                ]
-                
-                # 根据文件组中的图片文件构建映射关系
-                if len(special_matches) > 0 and len(self.current_group.image_files) > 0:
-                    # 如果特殊图片引用数量与图片文件数量相同，则按顺序匹配
-                    if len(special_matches) <= len(self.current_group.image_files):
-                        for i, desc in enumerate(special_matches):
-                            if i < len(self.current_group.image_files):
-                                img_file = self.current_group.image_files[i]
-                                image_map[desc] = os.path.basename(img_file.path)
-                    # 否则，使用固定的描述映射（如果有匹配的描述）
-                    else:
-                        for i, img_file in enumerate(self.current_group.image_files):
-                            if i < len(image_descriptions):
-                                image_map[image_descriptions[i]] = os.path.basename(img_file.path)
+            # 跟踪已处理的图片
+            processed_images = set()
             
             # 分段處理
             paragraphs = re.split(r'\n\s*\n', content)
@@ -787,37 +775,56 @@ class PDFGenerator:
                 if not para.strip():
                     continue
                 
+                # 维护一个标记，表示该段落是否已经处理过图片
+                paragraph_processed = False
+                
                 # 检查是否是特殊图片引用段落
                 special_img_match = re.match(r'^\s*' + special_image_pattern + r'\s*$', para)
-                if special_img_match:
-                    # 获取图片描述
+                if special_img_match and not paragraph_processed:
                     img_desc = special_img_match.group(1)
+                    image_key = f"special:{img_desc}"
                     
-                    self._add_special_image(elements, img_desc, image_map)
+                    if image_key not in processed_images:
+                        self._add_special_image(elements, img_desc, image_map)
+                        processed_images.add(image_key)
+                        logger.debug(f"添加特殊图片: {img_desc}")
+                    
+                    paragraph_processed = True
                     continue
                 
                 # 检查是否是标准Markdown图片段落
                 markdown_img_match = re.match(r'^\s*' + markdown_image_pattern + r'\s*$', para)
-                if markdown_img_match:
+                if markdown_img_match and not paragraph_processed:
                     alt_text = markdown_img_match.group(1)
                     img_path = markdown_img_match.group(2)
-                    logger.debug(f"处理标准Markdown图片段落: alt='{alt_text}', path='{img_path}'")
-                    self._add_markdown_image(elements, img_path, alt_text)
+                    image_key = f"markdown:{img_path}"
+                    
+                    if image_key not in processed_images:
+                        self._add_markdown_image(elements, img_path, alt_text)
+                        processed_images.add(image_key)
+                        logger.debug(f"添加标准Markdown图片: {img_path}")
+                    
+                    paragraph_processed = True
                     continue
                 
                 # 检查是否是简化的Markdown图片段落
                 simple_img_match = re.match(r'^\s*' + simple_image_pattern + r'\s*$', para)
-                if simple_img_match:
+                if simple_img_match and not paragraph_processed:
                     img_path = simple_img_match.group(1)
-                    logger.debug(f"处理简化Markdown图片段落: path='{img_path}'")
-                    self._add_markdown_image(elements, img_path, "")
+                    image_key = f"simple:{img_path}"
+                    
+                    if image_key not in processed_images:
+                        self._add_markdown_image(elements, img_path, "")
+                        processed_images.add(image_key)
+                        logger.debug(f"添加简化Markdown图片: {img_path}")
+                    
+                    paragraph_processed = True
                     continue
                 
                 # 检查段落中是否包含特殊图片引用
                 special_img_refs = re.findall(special_image_pattern, para)
-                if special_img_refs:
+                if special_img_refs and not paragraph_processed:
                     # 处理混合内容段落（文本和特殊图片引用）
-                    # 分割文本和图片
                     text_parts = re.split(special_image_pattern, para)
                     
                     # 添加第一部分文本（如果有）
@@ -827,21 +834,24 @@ class PDFGenerator:
                     
                     # 添加图片和后续文本
                     for j, img_desc in enumerate(special_img_refs):
-                        # 添加图片
-                        self._add_special_image(elements, img_desc, image_map)
+                        image_key = f"special:{img_desc}"
+                        if image_key not in processed_images:
+                            self._add_special_image(elements, img_desc, image_map)
+                            processed_images.add(image_key)
+                            logger.debug(f"添加混合内容中的特殊图片: {img_desc}")
                         
                         # 添加图片后的文本（如果有）
                         if j+1 < len(text_parts) and text_parts[j+1].strip():
                             elements.append(Paragraph(text_parts[j+1].replace('\n', '<br/>'), 
                                                    self.styles['ChineseNormal']))
+                    
+                    paragraph_processed = True
+                    continue
                 
                 # 检查段落中是否包含Markdown图片
-                elif re.search(markdown_image_pattern, para) or re.search(simple_image_pattern, para):
-                    # 先处理标准格式
+                if not paragraph_processed:
+                    # 处理标准Markdown图片
                     if re.search(markdown_image_pattern, para):
-                        logger.debug(f"处理混合段落，包含标准Markdown图片引用")
-                        
-                        # 分割文本和图片
                         text_parts = re.split(markdown_image_pattern, para)
                         img_matches = re.findall(markdown_image_pattern, para)
                         
@@ -854,20 +864,21 @@ class PDFGenerator:
                         text_index = 1
                         for j, match in enumerate(img_matches):
                             alt_text, img_path = match
-                            logger.debug(f"  处理Markdown图片: alt='{alt_text}', path='{img_path}'")
-                            self._add_markdown_image(elements, img_path, alt_text)
+                            image_key = f"markdown:{img_path}"
                             
-                            # 添加图片后的文本（如果有，且不是图片的一部分）
+                            if image_key not in processed_images:
+                                self._add_markdown_image(elements, img_path, alt_text)
+                                processed_images.add(image_key)
+                                logger.debug(f"添加混合内容中的标准Markdown图片: {img_path}")
+                            
+                            # 添加图片后的文本（如果有）
                             if text_index < len(text_parts) and text_parts[text_index].strip():
                                 elements.append(Paragraph(text_parts[text_index].replace('\n', '<br/>'),
                                                        self.styles['ChineseNormal']))
-                            text_index += 2  # 标准格式每匹配一次会在text_parts中产生两个元素
+                            text_index += 2
                     
-                    # 然后处理简化格式
+                    # 处理简化Markdown图片
                     elif re.search(simple_image_pattern, para):
-                        logger.debug(f"处理混合段落，包含简化Markdown图片引用")
-                        
-                        # 分割文本和图片
                         text_parts = re.split(simple_image_pattern, para)
                         img_paths = re.findall(simple_image_pattern, para)
                         
@@ -878,18 +889,23 @@ class PDFGenerator:
                         
                         # 添加图片和后续文本
                         for j, img_path in enumerate(img_paths):
-                            logger.debug(f"  处理简化Markdown图片: path='{img_path}'")
-                            self._add_markdown_image(elements, img_path, "")
+                            image_key = f"simple:{img_path}"
+                            
+                            if image_key not in processed_images:
+                                self._add_markdown_image(elements, img_path, "")
+                                processed_images.add(image_key)
+                                logger.debug(f"添加混合内容中的简化Markdown图片: {img_path}")
                             
                             # 添加图片后的文本（如果有）
                             if j+1 < len(text_parts) and text_parts[j+1].strip():
                                 elements.append(Paragraph(text_parts[j+1].replace('\n', '<br/>'),
                                                        self.styles['ChineseNormal']))
-                else:
-                    # 处理不包含图片的普通段落
-                    para = para.replace('\n', '<br/>')
-                    elements.append(Paragraph(para, self.styles['ChineseNormal']))
-                    elements.append(Spacer(0, 0.1*inch))
+                    
+                    # 如果段落中没有图片，直接添加文本
+                    else:
+                        elements.append(Paragraph(para.replace('\n', '<br/>'), 
+                                               self.styles['ChineseNormal']))
+                        elements.append(Spacer(0, 0.1*inch))
             
             # 在文本後添加更小的間距，以便與圖片更好地融合
             elements.append(Spacer(0, 0.15*inch))
@@ -1453,29 +1469,70 @@ class BatchProcessor:
         return result_files
 
     def _process_group(self, file_group: FileGroup) -> Optional[Path]:
-        """處理單個文件組，生成PDF"""
+        """处理单个文件组，生成PDF"""
         try:
-            # 創建輸出文件路徑
-            output_file = os.path.join(self.output_dir, f"{file_group.group_key}.pdf")
+            # 首先读取文本文件内容以获取标题
+            if not file_group.text_files:
+                logger.warning(f"组 {file_group.group_key} 没有文本文件")
+                return None
+
+            first_text_file = file_group.text_files[0]
+            title = None
             
-            # 使用更新後的PDFGenerator初始化方式
+            try:
+                with open(first_text_file.path, 'r', encoding='utf-8') as f:
+                    first_lines = [line.strip() for line in f.readlines(2000)][:20]
+                    for line in first_lines:
+                        if line.startswith('标题:') or line.startswith('標題:'):
+                            title = line.split(':', 1)[1].strip()
+                            break
+                        elif line and len(line) > 3 and len(line) < 200:
+                            # 排除看起来像URL或其他非标题内容的行
+                            if not line.startswith(('http', 'www', '#', '/')):
+                                title = line
+                                break
+            except Exception as e:
+                logger.warning(f"读取文件获取标题时出错: {e}")
+
+            # 如果找到标题，使用标题作为文件名
+            if title:
+                # 清理标题中的非法字符
+                safe_title = re.sub(r'[<>:"/\\|?*]', '_', title)
+                # 限制文件名长度
+                if len(safe_title.encode('utf-8')) > 200:  # 限制字节长度
+                    safe_title = safe_title[:50]  # 取前50个字符
+                
+                # 构建输出文件路径
+                output_file = os.path.join(self.output_dir, f"{safe_title}.pdf")
+            else:
+                # 如果没有找到标题，使用默认的group_key
+                output_file = os.path.join(self.output_dir, f"{file_group.group_key}.pdf")
+
+            # 使用更新后的PDFGenerator初始化方式
             pdf_generator = PDFGenerator(
                 output_file=output_file,
                 article_id=file_group.group_key,
-                title=file_group.group_key
+                title=title or file_group.group_key
             )
             
-            # 設置輸入目錄路徑
+            # 设置输入目录路径
             pdf_generator.input_dir = self.input_dir
-            # 設置當前處理的文件組
+            # 设置当前处理的文件组
             pdf_generator.current_group = file_group
             
-            return pdf_generator.generate_pdf(file_group)
+            # 生成PDF
+            result = pdf_generator.generate_pdf(file_group)
+            
+            # 如果生成成功，返回实际的输出文件路径
+            if result and os.path.exists(pdf_generator.output_file):
+                return pdf_generator.output_file
+            return None
+            
         except Exception as e:
-            logger.error(f"処理文件組時出錯 '{file_group.group_key}': {e}")
-            # 記錄詳細堆疊跟蹤以便調試
+            logger.error(f"处理文件组时出错 '{file_group.group_key}': {e}")
+            # 记录详细堆栈跟踪以便调试
             import traceback
-            logger.debug(f"錯誤詳情: {traceback.format_exc()}")
+            logger.debug(f"错误详情: {traceback.format_exc()}")
             raise e
 
     def resilient_process(self, file_groups: List[FileGroup], 
