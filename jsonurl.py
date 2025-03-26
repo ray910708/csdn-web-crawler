@@ -87,6 +87,7 @@ class Article:
     error: Optional[str] = None
     paywall_score: int = 0  # 新增: 付費牆得分
     paywall_details: Dict[str, Any] = field(default_factory=dict)  # 新增: 付費牆詳細信息
+    image_map: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # 新增: 圖片URL到本地路徑的映射
     
     def __post_init__(self):
         """初始化後自動生成ID（如果未提供）"""
@@ -863,7 +864,8 @@ class GenericContentExtractor(ContentExtractor):
             'author': '',
             'content': '',
             'publish_date': '',
-            'images': []
+            'images': [],
+            'url': url  # 添加URL以便標準化圖片路徑
         }
         
         # 提取標題
@@ -892,28 +894,65 @@ class GenericContentExtractor(ContentExtractor):
             main_content = soup.body
         
         if main_content:
-            # 提取正文
-            paragraphs = []
-            for p in main_content.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
-                text = p.get_text(strip=True)
-                if text and len(text) > 20:  # 忽略太短的段落
-                    tag_name = p.name
-                    if tag_name.startswith('h'):
-                        paragraphs.append(f"\n## {text}\n")
-                    else:
-                        paragraphs.append(f"{text}\n\n")
+            # 創建圖片URL到本地路徑的映射
+            image_map = {}
             
-            result['content'] = "".join(paragraphs)
-            
-            # 提取圖片
+            # 先提取所有圖片信息
             for img in main_content.find_all('img'):
                 img_url = img.get('src') or img.get('data-src') or img.get('data-original')
                 if img_url:
-                    img_alt = img.get('alt', '')
-                    result['images'].append({
-                        'url': TextUtils.normalize_url(img_url, url),
-                        'alt': img_alt
-                    })
+                    # 標準化URL
+                    img_url = TextUtils.normalize_url(img_url, url)
+                    img_alt = img.get('alt', '') or '圖片'
+                    
+                    img_data = {
+                        'url': img_url,
+                        'alt': img_alt,
+                        'local_path': None,
+                        'downloaded': False
+                    }
+                    
+                    image_map[img_url] = img_data
+                    result['images'].append(img_data)
+            
+            # 提取正文並嵌入圖片
+            paragraphs = []
+            
+            # 遍歷主要內容中的所有元素
+            for element in main_content.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'img']):
+                if element.name.startswith('h'):
+                    # 標題處理
+                    text = element.get_text(strip=True)
+                    if text:
+                        heading_level = int(element.name[1])
+                        paragraphs.append(f"\n{'#' * heading_level} {text}\n")
+                elif element.name == 'img':
+                    # 圖片處理
+                    img_url = element.get('src') or element.get('data-src') or element.get('data-original')
+                    if img_url:
+                        img_url = TextUtils.normalize_url(img_url, url)
+                        img_alt = element.get('alt', '') or '圖片'
+                        
+                        # 添加Markdown圖片語法
+                        paragraphs.append(f"\n![{img_alt}]({img_url})\n\n")
+                elif element.name == 'p':
+                    # 段落處理
+                    text = element.get_text(strip=True)
+                    if text and len(text) > 20:  # 忽略太短的段落
+                        paragraphs.append(f"{text}\n\n")
+                    
+                    # 處理段落中的圖片
+                    for img in element.find_all('img'):
+                        img_url = img.get('src') or img.get('data-src') or img.get('data-original')
+                        if img_url:
+                            img_url = TextUtils.normalize_url(img_url, url)
+                            img_alt = img.get('alt', '') or '圖片'
+                            
+                            # 添加Markdown圖片語法
+                            paragraphs.append(f"\n![{img_alt}]({img_url})\n\n")
+            
+            result['content'] = "".join(paragraphs)
+            result['image_map'] = image_map
         
         # 嘗試提取作者信息
         author_selectors = [
@@ -1004,7 +1043,8 @@ class CSDNContentExtractor(ContentExtractor):
             'publish_date': '',
             'images': [],
             'is_paywall': False,
-            'paywall_analysis': {}
+            'paywall_analysis': {},
+            'url': url  # 添加URL以便在_process_content中使用
         }
         
         # 1. 付費牆檢測 - 專用於CSDN的精確分析
@@ -1126,6 +1166,7 @@ class CSDNContentExtractor(ContentExtractor):
         2. 數學公式特殊處理
         3. 層次標題結構保留
         4. 表格內容的結構化提取
+        5. 圖片嵌入到原始位置（新增）
         """
         # 處理代碼塊
         for pre in container.find_all('pre'):
@@ -1141,10 +1182,45 @@ class CSDNContentExtractor(ContentExtractor):
                 code_text = code.get_text(strip=True)
                 pre.replace_with(f"\n```{language}\n{code_text}\n```\n")
         
+        # 創建圖片URL到本地路徑的映射（包含圖片的元數據）
+        image_map = {}
+        for img in container.find_all('img'):
+            img_url = img.get('src') or img.get('data-src') or img.get('data-original')
+            if img_url:
+                # 標準化URL
+                img_url = TextUtils.normalize_url(img_url, result.get('url', ''))
+                
+                img_data = {
+                    'url': img_url,
+                    'alt': img.get('alt', ''),
+                    'width': img.get('width', ''),
+                    'height': img.get('height', ''),
+                    'is_latex': 'mathjax' in img.get('class', []),
+                    'local_path': None,  # 將在下載後填充
+                    'downloaded': False  # 下載狀態標記
+                }
+                
+                image_map[img_url] = img_data
+                result['images'].append(img_data)
+        
         # 提取結構化內容
         content_parts = []
-        for element in container.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'pre', 'ol', 'ul', 'table']):
-            if element.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+        for element in container.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'pre', 'ol', 'ul', 'table', 'img']):
+            if element.name == 'img':
+                # 處理圖片元素，將其轉換為Markdown圖片語法
+                img_url = element.get('src') or element.get('data-src') or element.get('data-original')
+                if img_url:
+                    # 標準化URL
+                    img_url = TextUtils.normalize_url(img_url, result.get('url', ''))
+                    alt_text = element.get('alt', '') or '圖片'
+                    
+                    # 使用映射中的圖片數據
+                    img_data = image_map.get(img_url, {'url': img_url, 'alt': alt_text})
+                    
+                    # 添加圖片Markdown
+                    content_parts.append(f"\n![{img_data['alt']}]({img_url})\n\n")
+            
+            elif element.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
                 heading_text = element.get_text(strip=True)
                 heading_level = int(element.name[1])
                 content_parts.append(f"\n{'#' * heading_level} {heading_text}\n")
@@ -1161,17 +1237,46 @@ class CSDNContentExtractor(ContentExtractor):
                 # 表格轉換為Markdown
                 table_md = self._convert_table_to_markdown(element)
                 content_parts.append(f"\n{table_md}\n")
-            else:
-                # 普通段落
-                text = element.get_text(strip=True)
-                if text:
-                    # 檢查是否為數學公式段落
-                    if element.find('span', class_='katex') or element.find('span', class_='MathJax'):
-                        # 保留數學公式標記
-                        content_parts.append(f"$$\n{text}\n$$\n\n")
-                    else:
-                        content_parts.append(f"{text}\n\n")
+            elif element.name == 'p':
+                # 普通段落，檢查是否包含圖片
+                images_in_p = element.find_all('img')
+                if images_in_p:
+                    # 如果段落包含圖片，先處理段落文本
+                    text = element.get_text(strip=True)
+                    if text:
+                        # 檢查是否為數學公式段落
+                        if element.find('span', class_='katex') or element.find('span', class_='MathJax'):
+                            # 保留數學公式標記
+                            content_parts.append(f"$$\n{text}\n$$\n\n")
+                        else:
+                            content_parts.append(f"{text}\n\n")
+                    
+                    # 然後處理段落中的每個圖片
+                    for img in images_in_p:
+                        img_url = img.get('src') or img.get('data-src') or img.get('data-original')
+                        if img_url:
+                            # 標準化URL
+                            img_url = TextUtils.normalize_url(img_url, result.get('url', ''))
+                            alt_text = img.get('alt', '') or '圖片'
+                            
+                            # 使用映射中的圖片數據
+                            img_data = image_map.get(img_url, {'url': img_url, 'alt': alt_text})
+                            
+                            # 添加圖片Markdown
+                            content_parts.append(f"\n![{img_data['alt']}]({img_url})\n\n")
+                else:
+                    # 普通段落處理（不包含圖片）
+                    text = element.get_text(strip=True)
+                    if text:
+                        # 檢查是否為數學公式段落
+                        if element.find('span', class_='katex') or element.find('span', class_='MathJax'):
+                            # 保留數學公式標記
+                            content_parts.append(f"$$\n{text}\n$$\n\n")
+                        else:
+                            content_parts.append(f"{text}\n\n")
         
+        # 存儲映射以供圖片下載使用
+        result['image_map'] = image_map
         result['content'] = "".join(content_parts)
     
     def _convert_table_to_markdown(self, table_element):
@@ -1278,12 +1383,14 @@ class ImageDownloader:
             return False, None, img_url
             
         try:
-            # 生成圖片檔案名
-            url_hash = hashlib.md5(img_url.encode()).hexdigest()
+            # 生成圖片檔案名 - 使用更長的哈希和文章ID前綴避免衝突
+            url_hash = hashlib.md5(img_url.encode()).hexdigest()[:12]
             file_ext = os.path.splitext(urlparse(img_url).path)[1]
             if not file_ext or len(file_ext) > 5:
                 file_ext = '.jpg'
-            img_filename = f"{article_id}_{url_hash}{file_ext}"
+            
+            # 使用文章ID和URL哈希組合，確保圖片檔案名不會與其他文章的圖片或文章檔案衝突
+            img_filename = f"img_{article_id}_{url_hash}{file_ext}"
             img_path = os.path.join(image_dir, img_filename)
             
             # 檢查圖片是否已下載
@@ -1355,9 +1462,8 @@ class WebScraper:
         # 確保輸出目錄存在
         os.makedirs(config.output_dir, exist_ok=True)
         
-        # 創建圖片目錄
-        self.image_dir = os.path.join(config.output_dir, 'images')
-        os.makedirs(self.image_dir, exist_ok=True)
+        # 圖片將直接保存在輸出目錄中，不再創建單獨的圖片子目錄
+        self.image_dir = config.output_dir
         
         # 初始化組件
         self.user_agent_manager = UserAgentManager()
@@ -1451,6 +1557,10 @@ class WebScraper:
             article.publish_date = extracted_data.get('publish_date', '')
             article.text_length = len(article.content)
             
+            # 儲存圖片映射（如果可用）
+            if 'image_map' in extracted_data:
+                article.image_map = extracted_data['image_map']
+            
             # 檢查內容長度
             if article.text_length < self.config.min_content_length and not article.is_paywall:
                 logger.warning(f"內容長度過短 ({article.text_length} 字符)，可能提取失敗: {url}")
@@ -1509,44 +1619,90 @@ class WebScraper:
         
         return response.text, response
     
-    def _download_article_images(self, article: Article, image_data: List[Dict[str, str]]):
+    def _download_article_images(self, article: Article, image_data: List[Dict[str, Any]]):
         """下載文章中的圖片"""
         if not image_data:
             return
             
         self.stats.total_images += len(image_data)
         
+        # 從提取器獲取圖片映射（如果可用）
+        image_map = getattr(article, 'image_map', {})
+        
         # 使用線程池並發下載圖片
         with ThreadPoolExecutor(max_workers=self.config.max_image_workers) as executor:
             futures = []
+            # 用於跟踪每個future對應的圖片資訊
+            future_to_img = {}
+            
             for img_info in image_data:
                 img_url = img_info['url']
-                futures.append(
-                    executor.submit(
-                        self.image_downloader.download, 
-                        img_url, 
-                        article.url, 
-                        self.image_dir, 
-                        article.id
-                    )
+                future = executor.submit(
+                    self.image_downloader.download, 
+                    img_url, 
+                    article.url, 
+                    self.image_dir, 
+                    article.id
                 )
+                futures.append(future)
+                future_to_img[future] = img_info
             
             # 收集下載結果
             for future in as_completed(futures):
                 try:
                     success, img_path, img_url = future.result()
+                    img_info = future_to_img[future]
+                    
                     if success and img_path:
-                        rel_path = os.path.relpath(img_path, self.config.output_dir)
+                        # 由於圖片現在和文章在同一目錄，只需使用文件名即可
+                        img_filename = os.path.basename(img_path)
+                        
+                        # 更新圖片資訊
                         article.images.append({
                             'url': img_url,
-                            'path': rel_path
+                            'path': img_filename  # 只使用檔案名稱
                         })
+                        
+                        # 更新原始圖片數據中的本地路徑
+                        if img_url in image_map:
+                            image_map[img_url]['local_path'] = img_filename
+                            image_map[img_url]['downloaded'] = True
+                        
                         self.stats.successful_images += 1
                     else:
+                        # 即使下載失敗，也標記為已處理
+                        if img_url in image_map:
+                            image_map[img_url]['downloaded'] = False
+                        
                         self.stats.failed_images += 1
                 except Exception as e:
                     self.stats.failed_images += 1
                     logger.error(f"處理圖片下載結果時出錯: {e}")
+        
+        # 更新文章內容中的圖片路徑
+        if image_map:
+            self._update_content_image_paths(article, image_map)
+    
+    def _update_content_image_paths(self, article: Article, image_map: Dict[str, Dict[str, Any]]):
+        """更新文章內容中的圖片路徑，將遠程URL替換為本地路徑"""
+        if not article.content or not image_map:
+            return
+            
+        content = article.content
+        
+        # 替換所有已下載圖片的URL為本地路徑
+        for img_url, img_data in image_map.items():
+            if img_data.get('downloaded') and img_data.get('local_path'):
+                # 本地圖片路徑（文件名）
+                local_path = img_data['local_path']
+                
+                # 匹配Markdown圖片語法: ![alt](url)
+                pattern = f"!\\[(.*?)\\]\\({re.escape(img_url)}\\)"
+                replacement = f"![\\1]({local_path})"
+                content = re.sub(pattern, replacement, content)
+        
+        # 更新文章內容
+        article.content = content
     
     def save_article(self, article: Article) -> Optional[str]:
         """
@@ -1597,12 +1753,11 @@ class WebScraper:
             else:
                 content.append(article.content)
             
-            # 添加圖片信息
-            if article.images:
-                content.append("\n\n" + "-" * 80 + "\n")
-                content.append(f"下載的圖片 ({len(article.images)}):\n")
-                for i, img in enumerate(article.images, 1):
-                    content.append(f"{i}. {img['path']} (源自: {img['url']})\n")
+            # 不再在文末添加圖片列表，因為圖片已嵌入到內容中
+            # 如果需要，可以添加圖片統計信息
+            downloaded_images = sum(1 for img in article.images if 'path' in img)
+            if downloaded_images > 0:
+                content.append(f"\n\n**注意**: 文章中的 {downloaded_images} 張圖片已嵌入到內容中，並保存在同一目錄下。\n")
             
             # 寫入文件
             with open(filepath, 'w', encoding='utf-8') as f:
@@ -1724,12 +1879,12 @@ def parse_arguments():
     import argparse
     
     parser = argparse.ArgumentParser(description="JSON URL爬蟲工具")
-    parser.add_argument("--input", default="./debug_output/collected_urls.json", help="包含URL的JSON輸入文件")
-    parser.add_argument("--output", default="./debug_output/scraped_articles", help="爬取內容的輸出目錄")
+    parser.add_argument("--input", default="./output/collected_urls.json", help="包含URL的JSON輸入文件")
+    parser.add_argument("--output", default="./output/articles", help="爬取內容的輸出目錄")
     parser.add_argument("--workers", type=int, default=3, help="最大並行工作數")
     parser.add_argument("--delay", type=float, default=2.0, help="請求間的延遲秒數")
     parser.add_argument("--timeout", type=int, default=30, help="請求超時秒數")
-    parser.add_argument("--retries", type=int, default=3, help="請求失敗時的最大重試次數")
+    parser.add_argument("--retries", type=int, default=6, help="請求失敗時的最大重試次數")
     parser.add_argument("--no-images", action="store_true", help="不下載圖片")
     parser.add_argument("--images", action="store_true", help="下載圖片 (優先於 --no-images)")
     parser.add_argument("--proxy", help="使用代理伺服器 (格式: http://user:pass@host:port)")
