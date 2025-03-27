@@ -1097,6 +1097,15 @@ class CSDNContentExtractor(ContentExtractor):
                 result['publish_date'] = date_element.get_text(strip=True)
                 break
         
+        # 完全移除所有不需要的UI元素，確保它們的內容（包括圖片）都不會被處理
+        # 1. 移除文章信息框
+        for article_info_box in soup.select('.article-info-box'):
+            article_info_box.decompose()  # 從DOM中完全移除整個元素
+            
+        # 2. 移除專欄廣告
+        for column_advert in soup.select('#blogColumnPayAdvert'):
+            column_advert.decompose()  # 從DOM中完全移除整個元素
+        
         # 5. 提取文章內容 - 自適應選擇器策略
         content_container = None
         content_selectors = [
@@ -1121,15 +1130,6 @@ class CSDNContentExtractor(ContentExtractor):
                     best_container = container
         
         content_container = best_container
-        
-        # 完全移除所有不需要的UI元素，確保它們的內容（包括圖片）都不會被處理
-        # 1. 移除文章信息框
-        for article_info_box in soup.select('.article-info-box'):
-            article_info_box.decompose()  # 從DOM中完全移除整個元素
-            
-        # 2. 移除專欄廣告
-        for column_advert in soup.select('#blogColumnPayAdvert'):
-            column_advert.decompose()  # 從DOM中完全移除整個元素
         
         if content_container:
             # 識別並處理付費牆限制的內容
@@ -1167,6 +1167,7 @@ class CSDNContentExtractor(ContentExtractor):
         3. 層次標題結構保留
         4. 表格內容的結構化提取
         5. 圖片嵌入到原始位置（新增）
+        6. 防止圖片重複添加（修復）
         """
         # 處理代碼塊
         for pre in container.find_all('pre'):
@@ -1181,6 +1182,10 @@ class CSDNContentExtractor(ContentExtractor):
                 
                 code_text = code.get_text(strip=True)
                 pre.replace_with(f"\n```{language}\n{code_text}\n```\n")
+        
+        # 移除專欄廣告圖片元素
+        for advert in container.select('#blogColumnPayAdvert'):
+            advert.decompose()
         
         # 創建圖片URL到本地路徑的映射（包含圖片的元數據）
         image_map = {}
@@ -1203,6 +1208,9 @@ class CSDNContentExtractor(ContentExtractor):
                 image_map[img_url] = img_data
                 result['images'].append(img_data)
         
+        # 添加集合來追蹤已處理的圖片URL
+        processed_image_urls = set()
+        
         # 提取結構化內容
         content_parts = []
         for element in container.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'pre', 'ol', 'ul', 'table', 'img']):
@@ -1212,13 +1220,17 @@ class CSDNContentExtractor(ContentExtractor):
                 if img_url:
                     # 標準化URL
                     img_url = TextUtils.normalize_url(img_url, result.get('url', ''))
-                    alt_text = element.get('alt', '') or '圖片'
                     
-                    # 使用映射中的圖片數據
-                    img_data = image_map.get(img_url, {'url': img_url, 'alt': alt_text})
-                    
-                    # 添加圖片Markdown
-                    content_parts.append(f"\n![{img_data['alt']}]({img_url})\n\n")
+                    # 只處理未處理過的圖片URL
+                    if img_url not in processed_image_urls:
+                        processed_image_urls.add(img_url)
+                        alt_text = element.get('alt', '') or '圖片'
+                        
+                        # 使用映射中的圖片數據
+                        img_data = image_map.get(img_url, {'url': img_url, 'alt': alt_text})
+                        
+                        # 添加圖片Markdown
+                        content_parts.append(f"\n![{img_data['alt']}]({img_url})\n\n")
             
             elif element.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
                 heading_text = element.get_text(strip=True)
@@ -1257,13 +1269,17 @@ class CSDNContentExtractor(ContentExtractor):
                         if img_url:
                             # 標準化URL
                             img_url = TextUtils.normalize_url(img_url, result.get('url', ''))
-                            alt_text = img.get('alt', '') or '圖片'
                             
-                            # 使用映射中的圖片數據
-                            img_data = image_map.get(img_url, {'url': img_url, 'alt': alt_text})
-                            
-                            # 添加圖片Markdown
-                            content_parts.append(f"\n![{img_data['alt']}]({img_url})\n\n")
+                            # 只處理未處理過的圖片URL
+                            if img_url not in processed_image_urls:
+                                processed_image_urls.add(img_url)
+                                alt_text = img.get('alt', '') or '圖片'
+                                
+                                # 使用映射中的圖片數據
+                                img_data = image_map.get(img_url, {'url': img_url, 'alt': alt_text})
+                                
+                                # 添加圖片Markdown
+                                content_parts.append(f"\n![{img_data['alt']}]({img_url})\n\n")
                 else:
                     # 普通段落處理（不包含圖片）
                     text = element.get_text(strip=True)
@@ -1752,12 +1768,6 @@ class WebScraper:
                 content.append(f"爬取失敗: {article.error}\n\n")
             else:
                 content.append(article.content)
-            
-            # 不再在文末添加圖片列表，因為圖片已嵌入到內容中
-            # 如果需要，可以添加圖片統計信息
-            downloaded_images = sum(1 for img in article.images if 'path' in img)
-            if downloaded_images > 0:
-                content.append(f"\n\n**注意**: 文章中的 {downloaded_images} 張圖片已嵌入到內容中，並保存在同一目錄下。\n")
             
             # 寫入文件
             with open(filepath, 'w', encoding='utf-8') as f:
