@@ -458,17 +458,18 @@ class PDFGenerator:
     """PDF生成器類"""
     
     def __init__(self, output_file: str, article_id: str="未知", title: str="未知標題"):
-        """
-        初始化PDF生成器
-        
-        Args:
-            output_file: 輸出的PDF文件路徑
-            article_id: 文章的ID
-            title: 文章的標題
-        """
+        """初始化 PDF 生成器"""
         self.output_file = output_file
         self.article_id = article_id
-        self.title = title
+        
+        # 標題預處理：確保有效的 UTF-8 編碼
+        if isinstance(title, str):
+            self.title = title
+        else:
+            try:
+                self.title = str(title, 'utf-8')
+            except:
+                self.title = "未知標題"
         
         # 設置頁面大小和邊距
         self.width, self.height = A4
@@ -480,7 +481,7 @@ class PDFGenerator:
         # 先創建樣式表
         self.styles = getSampleStyleSheet()
         
-        # 然後註冊字體
+        # 註冊字體
         self._register_fonts()
         
         # 設置文檔模板和樣式
@@ -785,6 +786,11 @@ class PDFGenerator:
                     image_key = f"special:{img_desc}"
                     
                     if image_key not in processed_images:
+                        # Initialize image_map if not available
+                        if 'image_map' not in locals() and not hasattr(self, 'image_map'):
+                            image_map = {}
+                        else:
+                            image_map = getattr(self, 'image_map', {})
                         self._add_special_image(elements, img_desc, image_map)
                         processed_images.add(image_key)
                         logger.debug(f"添加特殊图片: {img_desc}")
@@ -836,6 +842,11 @@ class PDFGenerator:
                     for j, img_desc in enumerate(special_img_refs):
                         image_key = f"special:{img_desc}"
                         if image_key not in processed_images:
+                            # Initialize image_map if not available
+                            if 'image_map' not in locals() and not hasattr(self, 'image_map'):
+                                image_map = {}
+                            else:
+                                image_map = getattr(self, 'image_map', {})
                             self._add_special_image(elements, img_desc, image_map)
                             processed_images.add(image_key)
                             logger.debug(f"添加混合内容中的特殊图片: {img_desc}")
@@ -1234,13 +1245,18 @@ class PDFGenerator:
     
     def _setup_doc_template(self, file_path):
         """设置文档模板及样式"""
+         # 創建文檔模板與明確的元數據
         self.doc = SimpleDocTemplate(
             file_path,
             pagesize=A4,
             rightMargin=36,
             leftMargin=36,
             topMargin=50,
-            bottomMargin=50
+            bottomMargin=50,
+            title=self.title,  # 使用編碼後的標題
+            author=f'PDF Generator (ID: {self.article_id})',
+            subject=self.title,
+            creator='Batch PDF Generator'
         )
         
         # 创建样式表
