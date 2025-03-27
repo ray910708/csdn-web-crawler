@@ -95,13 +95,20 @@ def terminate_threads():
     
     # 使用結構化方式等待執行緒結束
     threads_to_wait = []
-    if 'backup_thread' in globals() and backup_thread.is_alive():
-        threads_to_wait.append(('備份執行緒', backup_thread))
-    if 'stats_thread' in locals() or 'stats_thread' in globals():
-        if 'stats_thread' in locals() and stats_thread.is_alive():
-            threads_to_wait.append(('統計執行緒', stats_thread))
-        elif 'stats_thread' in globals() and stats_thread.is_alive():
-            threads_to_wait.append(('統計執行緒', stats_thread))
+    # 安全獲取全局變量
+    backup_thread_obj = globals().get('backup_thread')
+    if backup_thread_obj and hasattr(backup_thread_obj, 'is_alive') and backup_thread_obj.is_alive():
+        threads_to_wait.append(('備份執行緒', backup_thread_obj))
+    
+    # 安全獲取統計線程
+    stats_thread_obj = None
+    if 'stats_thread' in locals():
+        stats_thread_obj = locals().get('stats_thread')
+    elif 'stats_thread' in globals():
+        stats_thread_obj = globals().get('stats_thread')
+    
+    if stats_thread_obj and hasattr(stats_thread_obj, 'is_alive') and stats_thread_obj.is_alive():
+        threads_to_wait.append(('統計執行緒', stats_thread_obj))
     
     # 等待所有執行緒，最多3秒
     for name, thread in threads_to_wait:
@@ -988,13 +995,31 @@ def debug_csdn_search_dynamic(query: str, output_dir: str = "debug_output", star
                         logger.warning("備份線程未能在2秒內終止")
             
             # 清理異步資源
-            try:
-                loop.run_until_complete(fetcher.close_session())
-            except Exception as e:
-                logger.error(f"關閉異步會話時出錯: {e}")
+            if 'loop' in locals():
+                current_loop = locals().get('loop')
+                if current_loop is not None:
+                    if not current_loop.is_closed() and current_loop.is_running():
+                        cleanup_task = asyncio.run_coroutine_threadsafe(cleanup_async_resources(), current_loop)
+                        try:
+                            # 給清理任務5秒時間
+                            cleanup_task.result(5)
+                        except Exception as e:
+                            logger.error(f"清理異步資源時出錯: {e}")
+                    elif not current_loop.is_closed():
+                        # 如果循環未運行，使用新的循環執行清理
+                        try:
+                            temp_loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(temp_loop)
+                            temp_loop.run_until_complete(cleanup_async_resources())
+                            temp_loop.close()
+                        except Exception as e:
+                            logger.error(f"使用臨時循環清理資源時出錯: {e}")
             
-            # 關閉事件循環
-            terminate_event_loop(loop)
+            # 3. 安全關閉事件循環
+            if 'loop' in locals():
+                current_loop = locals().get('loop')
+                if current_loop is not None and not current_loop.is_closed():
+                    terminate_event_loop(current_loop)
         except Exception as e:
             logger.error(f"关闭异步事件循环时出错: {e}")
         
@@ -1827,41 +1852,49 @@ def benchmark_url_backup(urls_count=10000, output_dir="benchmark_results"):
 
 # 使用性能監控裝飾器優化備份函數
 @measure_performance
-def save_urls_to_backup_json():
+def save_urls_to_backup_json(article_urls=None, query=None, processed_urls=None, fetcher=None, url_discovery_times=None, url_backup_file_json=None):
+    """保存已收集的URL到JSON備份文件"""
     try:
-        # 構建備份數據結構
+        # 使用全局變量如果未提供參數
+        if article_urls is None:
+            article_urls = globals().get('article_urls', [])
+        if query is None:
+            query = globals().get('query', "")
+        if processed_urls is None:
+            processed_urls = globals().get('processed_urls', set())
+        if url_discovery_times is None:
+            url_discovery_times = globals().get('url_discovery_times', {})
+        if url_backup_file_json is None:
+            url_backup_file_json = globals().get('url_backup_file_json', "collected_urls.json")
+        
+        # 建立備份數據
         backup_data = {
             "metadata": {
                 "timestamp": datetime.now().isoformat(),
                 "total_urls": len(article_urls),
                 "query": query,
-                "version": "1.0",
-                "scraping_stats": {
-                    "processed": len(processed_urls),
-                    "success_count": fetcher.success_count,
-                    "duplicate_count": fetcher.duplicate_count,
-                    "failed_count": fetcher.failed_count
-                }
+                "processed_count": len(processed_urls),
+                "version": "2.0"
             },
             "urls": [
                 {
                     "url": url,
                     "discovered_at": url_discovery_times.get(url, datetime.now().isoformat()),
-                    "processed": url in processed_urls,
-                    "retry_count": getattr(url, '_retry_count', 0) if hasattr(url, '_retry_count') else 0
+                    "processed": url in processed_urls
                 } for url in article_urls
             ]
         }
         
-        # 使用JSON格式寫入文件
+        # 保存到文件
+        os.makedirs(os.path.dirname(url_backup_file_json) if os.path.dirname(url_backup_file_json) else '.', exist_ok=True)
         with open(url_backup_file_json, "w", encoding="utf-8") as f:
             json.dump(backup_data, f, ensure_ascii=False, indent=2)
             
         logger.info(f"已將 {len(article_urls)} 個URL以JSON格式保存到備份文件")
+        return True
     except Exception as e:
         logger.error(f"保存URL到JSON備份文件時出錯: {e}")
-        # 嘗試使用文本格式作為後備方案
-        save_urls_to_backup()
+        return False
 
 class URLShardManager:
     """URL分片管理器 - 處理大型collected_urls.json檔案"""
@@ -2450,26 +2483,30 @@ if __name__ == "__main__":
             
             # 2. 清理異步資源
             if 'loop' in locals():
-                if not loop.is_closed() and loop.is_running():
-                    cleanup_task = asyncio.run_coroutine_threadsafe(cleanup_async_resources(), loop)
-                    try:
-                        # 給清理任務5秒時間
-                        cleanup_task.result(5)
-                    except Exception as e:
-                        logger.error(f"清理異步資源時出錯: {e}")
-                elif not loop.is_closed():
-                    # 如果循環未運行，使用新的循環執行清理
-                    try:
-                        temp_loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(temp_loop)
-                        temp_loop.run_until_complete(cleanup_async_resources())
-                        temp_loop.close()
-                    except Exception as e:
-                        logger.error(f"使用臨時循環清理資源時出錯: {e}")
+                current_loop = locals().get('loop')
+                if current_loop is not None:
+                    if not current_loop.is_closed() and current_loop.is_running():
+                        cleanup_task = asyncio.run_coroutine_threadsafe(cleanup_async_resources(), current_loop)
+                        try:
+                            # 給清理任務5秒時間
+                            cleanup_task.result(5)
+                        except Exception as e:
+                            logger.error(f"清理異步資源時出錯: {e}")
+                    elif not current_loop.is_closed():
+                        # 如果循環未運行，使用新的循環執行清理
+                        try:
+                            temp_loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(temp_loop)
+                            temp_loop.run_until_complete(cleanup_async_resources())
+                            temp_loop.close()
+                        except Exception as e:
+                            logger.error(f"使用臨時循環清理資源時出錯: {e}")
             
             # 3. 安全關閉事件循環
-            if 'loop' in locals() and not loop.is_closed():
-                terminate_event_loop(loop)
+            if 'loop' in locals():
+                current_loop = locals().get('loop')
+                if current_loop is not None and not current_loop.is_closed():
+                    terminate_event_loop(current_loop)
             
             logger.info("程序資源已完全清理，準備正常退出")
         except Exception as e:
